@@ -198,6 +198,10 @@ def css() -> None:
           .pill {display:inline-block; border-radius:999px; padding:.28rem .62rem; margin:0 .35rem .35rem 0; font-size:.78rem; font-weight:650; background:#e4f3ef; color:#086a61;}
           .pill.review {background:#fff1d7; color:#8b5800;}
           .meta {color:var(--muted); font-size:.91rem;}
+          .class-row {display:flex; flex-wrap:wrap; align-items:center; gap:.45rem 2.4rem; background:white; border:1px solid var(--line); border-radius:12px; padding:.7rem 1rem; margin:.85rem 0;}
+          .class-row .title {font-weight:750; color:var(--ink); letter-spacing:-.03em;}
+          .class-row .label {color:var(--muted); font-size:.86rem; margin-right:.35rem;}
+          .class-row .value {font-weight:680; color:var(--ink);}
           .nav-grid {display:flex; gap:.42rem; flex-wrap:wrap; margin:1rem 0 .4rem;}
           .nav-grid a {text-decoration:none!important; border:1px solid #cee2dd; color:#075e56!important; background:white; border-radius:10px; padding:.55rem .72rem; font-weight:650; font-size:.88rem;}
           .nav-grid a:hover {background:#e9f5f2;}
@@ -335,10 +339,17 @@ def render_drug_detail(drug: dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
 
-    with report_section("classification", "약효분류코드", "DRUG CLASSIFICATION"):
-        left, right = st.columns(2)
-        left.metric("분류코드", drug.get("category_code", "-"))
-        right.metric("분류명", drug.get("category_name", "-"))
+    st.markdown(
+        f"""
+        <span id="classification"></span>
+        <div class="class-row">
+          <span class="title">약효분류코드</span>
+          <span><span class="label">분류코드 :</span><span class="value">{esc(drug.get("category_code", "-"))}</span></span>
+          <span><span class="label">분류명 :</span><span class="value">{esc(drug.get("category_name", "-"))}</span></span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     render_diagnosis_section(drug)
 

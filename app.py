@@ -559,41 +559,80 @@ def main_pill(is_main: bool) -> str:
 
 
 # ─────────────────────────────────────────────
-# AI
+# AI - Google Gemini (무료 API)
 # ─────────────────────────────────────────────
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_URL   = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+
 def ai_ok() -> bool:
-    return bool(secret("OPENAI_API_KEY"))
+    return bool(secret("GEMINI_API_KEY"))
 
 
 def call_ai(drug: dict, note: str, task: str) -> str:
-    api_key = secret("OPENAI_API_KEY")
-    model   = secret("OPENAI_MODEL", "gpt-4.1-mini")
-    if not api_key:
-        return "OPENAI_API_KEY 미설정 — 규칙 기반 결과만 표시됩니다."
-    ctx = {"약제":drug.get("name"),"성분":drug.get("ingredient_display"),
-           "효능":drug.get("efficacy",[]),"메모":note}
+    gemini_key = secret("GEMINI_API_KEY")
+    if not gemini_key:
+        return "GEMINI_API_KEY 미설정 — Streamlit Secrets에 키를 입력하면 AI 기능이 활성화됩니다."
+
+    ctx = {
+        "약제명": drug.get("name",""),
+        "성분명": drug.get("ingredient_display",""),
+        "효능효과": drug.get("efficacy",[]),
+        "용법용량": drug.get("dosage_official",[]),
+        "주의사항": drug.get("cautions",[]),
+        "금기사항": drug.get("contraindications",[]),
+        "메모": note,
+    }
     prompt = (
-        "당신은 병원 청구심사 검토 보조자입니다. "
-        "진단·급여 확정이 아닌 확인 자료 정리 메모를 작성하십시오.\n"
-        f"작업: {task}\n'검토 요약', '확인 근거', '주의사항' 세 단락으로 한국어 응답.\n"
-        + json.dumps(ctx, ensure_ascii=False)
+        "당신은 병원 청구심사 검토를 보조하는 전문가입니다.\n"
+        "⚠️ 주의: 급여 인정 확정·진단·처방 판단은 하지 마세요. "
+        "담당자가 확인할 사항을 정리하는 메모를 작성하십시오.\n\n"
+        f"[작업] {task}\n\n"
+        f"[약제 정보]\n{json.dumps(ctx, ensure_ascii=False, indent=2)}\n\n"
+        "다음 세 단락으로 한국어로 작성하세요:\n"
+        "1. 검토 요약 (3줄 이내)\n"
+        "2. 확인 근거 (체크리스트 형태)\n"
+        "3. 심사 주의사항"
     )
+
     try:
         r = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json"},
-            json={"model":model,"input":prompt},
+            GEMINI_URL,
+            params={"key": gemini_key},
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "maxOutputTokens": 1024,
+                },
+                "safetySettings": [
+                    {"category": "HARM_CATEGORY_HARASSMENT",       "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH",      "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT","threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT","threshold": "BLOCK_NONE"},
+                ],
+            },
             timeout=30,
         )
         r.raise_for_status()
         d = r.json()
-        if d.get("output_text"):
-            return d["output_text"]
-        parts = [c["text"] for o in d.get("output",[])
-                 for c in o.get("content",[]) if c.get("text")]
-        return "\n".join(parts) or "AI 응답 해석 실패"
+        # Gemini 응답 파싱
+        candidates = d.get("candidates", [])
+        if candidates:
+            parts = candidates[0].get("content", {}).get("parts", [])
+            text = "".join(p.get("text","") for p in parts).strip()
+            if text:
+                return text
+        return "Gemini 응답을 파싱할 수 없습니다. 잠시 후 다시 시도하세요."
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 400:
+            return "API 키가 올바르지 않습니다. Streamlit Secrets의 GEMINI_API_KEY를 확인하세요."
+        if e.response is not None and e.response.status_code == 429:
+            return "Gemini 무료 API 호출 한도에 도달했습니다. 잠시 후 다시 시도하세요."
+        return f"Gemini 연결 실패: {e}"
     except Exception as e:
-        return f"AI 연결 실패 ({e.__class__.__name__})"
+        return f"AI 연결 실패 ({e.__class__.__name__}): {e}"
 
 
 # ─────────────────────────────────────────────
@@ -707,16 +746,18 @@ def render_icd_section(drug: dict, api_key: str) -> None:
             else:
                 st.warning(f"결과 없음 또는 오류: {res.get('error','')}")
 
-        # AI 상병 검토
+        # Gemini AI 상병 검토
         if ai_ok():
             st.markdown("---")
-            st.markdown("**🤖 AI 보조 상병 검토**")
+            st.markdown("**🤖 Gemini AI 보조 상병 검토**")
             note = st.text_area("진료기록 요약 또는 검사 목적",
-                                 placeholder="예: 대장암 선별 목적의 대장내시경 예정",
+                                 placeholder="예: 대장암 선별 목적의 대장내시경 예정, 고혈압 진단 후 첫 처방",
                                  key=f"dx-note-{drug['id']}", height=70)
-            if st.button("AI 상병 검토 생성", key=f"dx-ai-{drug['id']}", type="primary"):
-                with st.spinner("AI 검토 중..."):
-                    st.info(call_ai(drug, note, "입력 진료기록에 부합하는 상병 후보 검토 메모 작성"))
+            if st.button("🤖 Gemini AI 상병 검토 생성", key=f"dx-ai-{drug['id']}", type="primary"):
+                with st.spinner("Gemini AI 분석 중..."):
+                    st.info(call_ai(drug, note, "입력된 진료기록에 부합하는 상병 후보 검토 메모 작성"))
+        else:
+            st.caption("💡 GEMINI_API_KEY 설정 시 AI 상병 검토가 활성화됩니다.")
 
 
 # ─────────────────────────────────────────────
@@ -732,6 +773,7 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
         review_res = api_review_criteria(drug.get("reimbursement_code",""), api_key)
 
     # ── API 상태 패널 ──
+    gemini_status = 'ok' if ai_ok() else 'skip'
     st.markdown(f"""
     <div class="api-panel">
       <div class="ap-title">🔌 공공데이터포털 API 연동 상태 (단일 키)</div>
@@ -759,6 +801,12 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
         <span class="ap-name">[15119055] 질병정보</span>
         {api_badge('ok' if api_key else 'skip')}
         <span style="font-size:.74rem;color:#557068;">상병코드 직접 검색</span>
+      </div>
+      <div style="border-top:1px solid #dce8e5;margin:.5rem 0;"></div>
+      <div class="api-row">
+        <span class="ap-name">🤖 Gemini AI (무료)</span>
+        {api_badge(gemini_status)}
+        <span style="font-size:.74rem;color:#557068;">상병검토·용법용량 AI 보조</span>
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -867,11 +915,11 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
         st.markdown("**🤖 AI 체크리스트**")
         for item in drug.get("dosage_ai_checklist",[]): st.markdown(f"- {item}")
         if ai_ok():
-            if st.button("용법용량 AI 검토 생성", key=f"dose-ai-{drug['id']}", type="primary"):
-                with st.spinner("AI 검토 중..."):
-                    st.info(call_ai(drug, "", "투여 전 확인 체크리스트 및 심사 주의사항"))
+            if st.button("🤖 Gemini AI 용법용량 검토 생성", key=f"dose-ai-{drug['id']}", type="primary"):
+                with st.spinner("Gemini AI 검토 중..."):
+                    st.info(call_ai(drug, "", "투여 전 확인 체크리스트 및 청구심사 주의사항 작성"))
         else:
-            st.caption("OPENAI_API_KEY 설정 시 AI 보조 검토가 활성화됩니다.")
+            st.caption("💡 GEMINI_API_KEY 설정 시 AI 보조 검토가 활성화됩니다.")
 
     # ══ 3. 효능효과 ══
     st.markdown('<span id="efficacy"></span>', unsafe_allow_html=True)
@@ -1108,28 +1156,60 @@ def page_api_guide() -> None:
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown("### secrets.toml 설정")
-    st.code("""
-# .streamlit/secrets.toml
-# ★ 공공데이터포털 인증키 1개로 5개 API 모두 연동
-PUBLIC_DATA_API_KEY = "공공데이터포털에서_발급받은_인증키"
+    # ── Gemini AI 안내 ──
+    st.markdown("### 🤖 AI 기능 (Google Gemini 무료)")
+    st.markdown(
+        '<div class="nb nb-info">ℹ️ AI 상병 검토·용법용량 분석은 <strong>Google Gemini 무료 API</strong>를 사용합니다. '
+        '월 사용량 한도 내에서 무료로 이용할 수 있습니다.</div>',
+        unsafe_allow_html=True
+    )
+    st.markdown(f"""
+    <div class="ref-card ref-공식" style="margin-bottom:.4rem;">
+      <div style="font-weight:800;color:#152622;">Google Gemini API
+        <span style="font-family:monospace;font-weight:400;color:#087f73;font-size:.85rem;"> gemini-2.0-flash</span>
+      </div>
+      <div style="font-size:.86rem;color:#3a5550;margin-top:.2rem;">
+        발급: <a href="https://aistudio.google.com" target="_blank">aistudio.google.com</a>
+        &nbsp;|&nbsp; 무료 티어 사용 가능 &nbsp;|&nbsp; 상병 검토·용법 분석·심사 메모 생성
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-ADMIN_PASSWORD = "관리자비밀번호"
-OPENAI_API_KEY = ""   # 선택사항
+    st.divider()
+
+    # ── Secrets 설정 ──
+    st.markdown("### Streamlit Cloud Secrets 설정")
+    st.markdown(
+        '<div class="nb nb-warn">⚠️ API 키는 절대 코드나 GitHub에 올리지 마세요. '
+        'Streamlit Cloud Secrets에만 입력하세요.</div>',
+        unsafe_allow_html=True
+    )
+    st.code("""\
+# Streamlit Cloud → 앱 Settings → Secrets 탭에 붙여넣기
+
+# ① 공공데이터포털 인증키 (data.go.kr 마이페이지에서 확인)
+PUBLIC_DATA_API_KEY = "여기에_공공데이터포털_인증키_입력"
+
+# ② Google Gemini API 키 (aistudio.google.com에서 발급)
+GEMINI_API_KEY = "여기에_Gemini_API_키_입력"
+
+# ③ 관리자 비밀번호
+ADMIN_PASSWORD = "여기에_관리자_비밀번호_입력"
 """, language="toml")
 
-    st.markdown("### Streamlit Cloud 설정 방법")
+    st.markdown("### Streamlit Cloud 설정 순서")
     st.markdown("""
-    1. share.streamlit.io → 앱 선택
-    2. **Settings** → **Secrets** 탭 클릭
-    3. 위 내용 그대로 붙여넣고 저장
-    4. 앱 자동 재시작 → API 연동 완료
+1. [share.streamlit.io](https://share.streamlit.io) → 본인 앱 클릭
+2. 우측 하단 **⋮** → **Settings** 클릭
+3. **Secrets** 탭 클릭
+4. 위 내용을 붙여넣고 실제 키 값 입력 후 **Save**
+5. 앱 자동 재시작 → 사이드바에서 ✅ 확인
     """)
 
     st.markdown(
-        '<div class="nb nb-info">ℹ️ API 키 신청: '
+        '<div class="nb nb-info">ℹ️ 공공데이터포털 API 키 확인: '
         '<a href="https://www.data.go.kr" target="_blank">www.data.go.kr</a> → '
-        '5개 API 각각 활용신청 → 승인 후 마이페이지에서 인증키 확인</div>',
+        '로그인 → 마이페이지 → 개발계정 → 인증키 발급현황</div>',
         unsafe_allow_html=True
     )
 
@@ -1137,6 +1217,200 @@ OPENAI_API_KEY = ""   # 선택사항
 # ─────────────────────────────────────────────
 # 페이지: 관리자
 # ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# CSV 컬럼 정의 (엑셀 작성 기준)
+# ─────────────────────────────────────────────
+CSV_COLUMNS = [
+    "약품명",           # name
+    "성분명",           # ingredient_display
+    "급여코드",         # reimbursement_code
+    "표준코드",         # standard_code
+    "상한금액",         # upper_price
+    "적용일",           # price_effective_date
+    "제조사",           # manufacturer
+    "투여경로",         # route  (경구 / 주사 / 외용 등)
+    "약효분류코드",     # category_code
+    "약효분류명",       # category_name
+    "전문일반구분",     # professional
+    "상태",             # status
+    "요약",             # summary
+    "효능효과",         # efficacy  (줄바꿈 | 로 구분)
+    "용법용량",         # dosage_official (| 구분)
+    "AI체크리스트",     # dosage_ai_checklist (| 구분)
+    "주의사항",         # cautions (| 구분)
+    "금기사항",         # contraindications (| 구분)
+    "배수처방",         # multiple_prescription (| 구분)
+    "동일성분약제명",   # same_ingredient[*].name (| 구분)
+    "동일성분코드",     # same_ingredient[*].code (| 구분)
+    "심사참고제목",     # review_references[*].title (| 구분)
+    "심사참고내용",     # review_references[*].body  (| 구분)
+    "심사참고레벨",     # review_references[*].level (| 구분)
+]
+
+SAMPLE_ROWS = [
+    {
+        "약품명": "씨엠쿨산",
+        "성분명": "폴리에틸렌글리콜3350·전해질·아스코르브산 복합제",
+        "급여코드": "648602750",
+        "표준코드": "8806486027515",
+        "상한금액": "9,290원 / 2000mL / 통",
+        "적용일": "2026-01-01",
+        "제조사": "씨엠지제약",
+        "투여경로": "경구",
+        "약효분류코드": "721",
+        "약효분류명": "X선조영제",
+        "전문일반구분": "전문의약품",
+        "상태": "검토 필요",
+        "요약": "대장 내시경 검사 전 장 정결에 사용되는 복합 산제입니다.",
+        "효능효과": "대장 내시경 검사 전 장 정결을 목적으로 사용되는 장정결제입니다.|장내 삼투압을 높여 수분을 유지하고 변 배출을 돕습니다.",
+        "용법용량": "18세 이상 성인 기준 총 2L 복용합니다.|분할 복용 시 검사 전날 저녁 1L + 당일 아침 1L를 복용합니다.",
+        "AI체크리스트": "검사 예정 시각과 전처치 방식을 확인합니다.|신장·심장 질환 위험 환자는 의료진이 검토합니다.",
+        "주의사항": "투여 초기 복부 팽만·복통이 나타날 수 있습니다.|탈수·전해질 이상 위험 환자는 처방 전 평가가 필요합니다.",
+        "금기사항": "소화관 폐색 또는 천공이 있거나 의심되는 환자는 투여 금지입니다.|이 약 구성성분에 과민반응이 있는 환자는 투여 금지입니다.",
+        "배수처방": "검사 1회에 필요한 처방 단위와 실제 검사 건을 대조합니다.|반복 처방 시 사유와 시행일을 기록에서 확인합니다.",
+        "동일성분약제명": "맥스쿨산|크린콜씨산",
+        "동일성분코드": "621802470|664102450",
+        "심사참고제목": "청구 전 확인 포인트|DUR 연계",
+        "심사참고내용": "검사 시행 여부, 처방 기록, 검사일과 투약일 연계를 확인하십시오.|환자 투약이력 및 금기 점검은 HIRA DUR 결과를 기준으로 확인하십시오.",
+        "심사참고레벨": "필수 확인|공식 시스템 확인",
+    },
+    {
+        "약품명": "케이캡정25밀리그램",
+        "성분명": "테고프라잔 25mg",
+        "급여코드": "640007800",
+        "표준코드": "",
+        "상한금액": "",
+        "적용일": "",
+        "제조사": "에이치케이이노엔(주)",
+        "투여경로": "경구",
+        "약효분류코드": "232",
+        "약효분류명": "소화성궤양용제",
+        "전문일반구분": "전문의약품",
+        "상태": "참고 예시",
+        "요약": "위산 분비 억제제(P-CAB 계열)로 역류성 식도염·위궤양 등에 사용합니다.",
+        "효능효과": "역류성 식도염 치료|위궤양 치료|헬리코박터 제균 요법(병용)",
+        "용법용량": "1일 1회 25mg 또는 50mg 경구 투여합니다.|식사와 관계없이 복용 가능합니다.",
+        "AI체크리스트": "적응증·함량·투여기간 및 급여기준 적용 여부를 확인합니다.",
+        "주의사항": "중증 간장애 환자는 신중 투여합니다.",
+        "금기사항": "이 약 성분에 과민반응 환자는 투여 금지입니다.",
+        "배수처방": "최신 심사기준 확인 필요합니다.",
+        "동일성분약제명": "",
+        "동일성분코드": "",
+        "심사참고제목": "",
+        "심사참고내용": "",
+        "심사참고레벨": "",
+    },
+    {
+        "약품명": "아목시실린캡슐250mg",
+        "성분명": "아목시실린 250mg",
+        "급여코드": "670700ATB",
+        "표준코드": "",
+        "상한금액": "",
+        "적용일": "",
+        "제조사": "샘플제약",
+        "투여경로": "경구",
+        "약효분류코드": "611",
+        "약효분류명": "주로 그람양성균에 작용하는 것",
+        "전문일반구분": "전문의약품",
+        "상태": "검토 필요",
+        "요약": "페니실린계 광범위 항생제로 상기도감염·중이염·요로감염 등에 사용합니다.",
+        "효능효과": "폐렴|상기도감염|급성 중이염|요로감염|피부 및 연조직 감염",
+        "용법용량": "성인 1회 250~500mg을 1일 3회 경구 투여합니다.|중증 감염 시 1회 500mg 1일 3회 투여합니다.",
+        "AI체크리스트": "페니실린 과민반응 이력을 반드시 확인합니다.|신기능 저하 환자는 용량 조절이 필요합니다.",
+        "주의사항": "페니실린계 항생제 과민반응 환자에서 신중 투여합니다.|장기 투여 시 내성균 및 비감수성균 발현에 주의합니다.",
+        "금기사항": "페니실린계 항생제에 과민반응 병력이 있는 환자는 투여 금지입니다.",
+        "배수처방": "감염 부위 및 중증도에 따른 용량·기간 기준을 확인합니다.",
+        "동일성분약제명": "아모크신캡슐|오구멘틴정(복합제)",
+        "동일성분코드": "670700ATB|670700BNB",
+        "심사참고제목": "항생제 적정 사용|세균 배양검사",
+        "심사참고내용": "항생제 처방 시 감염 부위·원인균·중증도를 확인하십시오.|세균 배양 및 감수성 검사 결과와 연계하여 검토합니다.",
+        "심사참고레벨": "필수 확인|보조",
+    },
+]
+
+
+def make_sample_csv() -> bytes:
+    df = pd.DataFrame(SAMPLE_ROWS, columns=CSV_COLUMNS)
+    return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+
+def csv_row_to_drug(row: pd.Series, idx: int) -> tuple[dict | None, list[str]]:
+    """CSV 한 행 → drug dict 변환. 오류 목록도 반환"""
+    errs = []
+
+    def col(name: str) -> str:
+        return str(row.get(name, "") or "").strip()
+
+    def split_pipe(name: str) -> list[str]:
+        val = col(name)
+        return [x.strip() for x in val.split("|") if x.strip()] if val else []
+
+    name = col("약품명")
+    ingr = col("성분명")
+    if not name:
+        errs.append(f"{idx}행: 약품명 누락")
+    if not ingr:
+        errs.append(f"{idx}행: 성분명 누락")
+    if errs:
+        return None, errs
+
+    # ID 자동 생성 (급여코드 우선, 없으면 약품명 해시)
+    code = col("급여코드")
+    drug_id = re.sub(r"[^a-z0-9]", "-", (code or name).lower())[:40]
+
+    # 동일성분 리스트
+    same_names = split_pipe("동일성분약제명")
+    same_codes = split_pipe("동일성분코드")
+    same_ingredient = [
+        {"name": n, "code": c, "note": "동일성분 보조 조회 결과입니다. HIRA 약가목록을 재확인하세요."}
+        for n, c in zip(same_names, same_codes + [""] * len(same_names))
+    ]
+
+    # 심사참고 리스트
+    ref_titles  = split_pipe("심사참고제목")
+    ref_bodies  = split_pipe("심사참고내용")
+    ref_levels  = split_pipe("심사참고레벨")
+    review_references = [
+        {"title": t, "body": b, "level": lv}
+        for t, b, lv in zip(
+            ref_titles,
+            ref_bodies  + [""] * len(ref_titles),
+            ref_levels  + ["보조"] * len(ref_titles),
+        )
+    ]
+
+    drug = {
+        "id": drug_id,
+        "name": name,
+        "ingredient_display": ingr,
+        "reimbursement_code": code,
+        "standard_code": col("표준코드"),
+        "upper_price": col("상한금액"),
+        "price_effective_date": col("적용일"),
+        "manufacturer": col("제조사"),
+        "route": col("투여경로") or "경구",
+        "category_code": col("약효분류코드"),
+        "category_name": col("약효분류명"),
+        "professional": col("전문일반구분") or "전문의약품",
+        "status": col("상태") or "검토 필요",
+        "verified_on": datetime.now().strftime("%Y-%m-%d"),
+        "summary": col("요약"),
+        "efficacy": split_pipe("효능효과"),
+        "dosage_official": split_pipe("용법용량"),
+        "dosage_ai_checklist": split_pipe("AI체크리스트"),
+        "cautions": split_pipe("주의사항"),
+        "contraindications": split_pipe("금기사항"),
+        "multiple_prescription": split_pipe("배수처방"),
+        "same_ingredient": same_ingredient,
+        "review_references": review_references,
+        "diagnosis_candidates": [],
+        "sources": [],
+        "ingredients": [ingr],
+    }
+    return drug, []
+
+
 def page_admin() -> None:
     st.header("🔐 관리자 데이터 관리")
     admin_pw = secret("ADMIN_PASSWORD")
@@ -1152,30 +1426,148 @@ def page_admin() -> None:
             else:
                 st.error("비밀번호 불일치")
         return
+
     st.success("✅ 관리자 인증 완료")
     if st.button("로그아웃"):
         st.session_state.admin_auth = False
         st.rerun()
+
     st.divider()
-    st.subheader("약제 JSON 업로드")
-    uploaded = st.file_uploader("JSON 파일", type=["json"])
-    if uploaded and st.button("검증 후 반영", type="primary"):
+
+    # ── 샘플 CSV 다운로드 ──
+    st.subheader("📥 샘플 양식 다운로드")
+    st.markdown(
+        '<div class="nb nb-info">ℹ️ 아래 샘플 CSV를 내려받아 <strong>엑셀</strong>에서 열고 약제 정보를 입력한 뒤 '
+        '<strong>CSV UTF-8 형식</strong>으로 저장해서 업로드하세요.</div>',
+        unsafe_allow_html=True
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            label="📄 샘플 CSV 다운로드 (씨엠쿨산·케이캡·아목시실린 예시 포함)",
+            data=make_sample_csv(),
+            file_name="claimlens_약제입력_샘플.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    st.divider()
+
+    # ── CSV 컬럼 안내 ──
+    with st.expander("📋 CSV 컬럼 작성 가이드 보기"):
+        guide_data = {
+            "컬럼명": [
+                "약품명","성분명","급여코드","표준코드","상한금액","적용일",
+                "제조사","투여경로","약효분류코드","약효분류명","전문일반구분","상태","요약",
+                "효능효과","용법용량","AI체크리스트","주의사항","금기사항","배수처방",
+                "동일성분약제명","동일성분코드",
+                "심사참고제목","심사참고내용","심사참고레벨",
+            ],
+            "필수여부": ["✅필수","✅필수","권장","선택","선택","선택",
+                        "권장","선택","선택","선택","선택","선택","선택",
+                        "권장","권장","선택","권장","권장","선택",
+                        "선택","선택","선택","선택","선택"],
+            "작성 방법": [
+                "약품 정식 명칭","성분명 및 함량","HIRA 급여코드","바코드 표준코드","예: 9,290원/통","예: 2026-01-01",
+                "제조·수입사명","경구/주사/외용 등","예: 232","예: 소화성궤양용제","전문의약품 또는 일반의약품","검토 필요 / 확인 완료 등","한 줄 요약",
+                "여러 항목은 | 로 구분","여러 항목은 | 로 구분","여러 항목은 | 로 구분","여러 항목은 | 로 구분","여러 항목은 | 로 구분","여러 항목은 | 로 구분",
+                "여러 약제는 | 로 구분","동일성분약제명과 순서 맞춰 | 구분",
+                "여러 항목은 | 로 구분","심사참고제목과 순서 맞춰 | 구분","필수 확인 / 보조 / 공식 시스템 확인",
+            ],
+        }
+        st.dataframe(pd.DataFrame(guide_data), hide_index=True, use_container_width=True)
+
+        st.markdown("""
+**| 구분 예시:**
+```
+효능효과 컬럼:  폐렴|상기도감염|요로감염
+용법용량 컬럼:  1일 3회 250mg 투여합니다.|중증 시 500mg으로 증량합니다.
+동일성분약제명: 아모크신캡슐|오구멘틴정
+동일성분코드:   670700ATB|670700BNB   ← 약제명과 같은 순서로 입력
+```
+        """)
+
+    st.divider()
+
+    # ── CSV 업로드 ──
+    st.subheader("📤 약제 CSV 업로드")
+    st.markdown(
+        '<div class="nb nb-warn">⚠️ 업로드 전 허가사항·급여목록·고시 최신 여부를 반드시 확인하십시오. '
+        '업로드 즉시 DB에 반영됩니다.</div>',
+        unsafe_allow_html=True
+    )
+
+    uploaded = st.file_uploader(
+        "CSV 파일 선택 (UTF-8 또는 UTF-8 BOM 저장)",
+        type=["csv"],
+        help="엑셀에서 '다른 이름으로 저장' → 'CSV UTF-8(쉼표로 분리)' 선택"
+    )
+
+    if uploaded:
         try:
-            records = json.loads(uploaded.getvalue().decode("utf-8"))
-            if not isinstance(records, list):
-                raise ValueError("최상위 형식이 배열이어야 합니다.")
-            errs = [f"{i}번: {e}" for i,r in enumerate(records,1) for e in validate(r)]
-            if errs:
-                st.error("\n".join(errs))
+            # 인코딩 자동 감지 (UTF-8 BOM / UTF-8 / EUC-KR 순)
+            raw = uploaded.getvalue()
+            for enc in ["utf-8-sig", "utf-8", "euc-kr"]:
+                try:
+                    df = pd.read_csv(pd.io.common.BytesIO(raw), encoding=enc, dtype=str)
+                    break
+                except Exception:
+                    continue
             else:
-                with get_conn() as conn:
-                    n = _upsert(conn, records)
-                st.success(f"{n}개 약제 반영 완료")
+                raise ValueError("파일 인코딩을 인식할 수 없습니다. UTF-8로 저장 후 다시 시도하세요.")
+
+            df = df.fillna("")
+            st.markdown(f"**미리보기** ({len(df)}행)")
+            st.dataframe(df.head(5), use_container_width=True)
+
+            # 필수 컬럼 체크
+            missing_cols = [c for c in ["약품명","성분명"] if c not in df.columns]
+            if missing_cols:
+                st.error(f"필수 컬럼 누락: {', '.join(missing_cols)}")
+            else:
+                if st.button("✅ 검증 후 DB 반영", type="primary"):
+                    records, all_errs = [], []
+                    for i, row in df.iterrows():
+                        drug, errs = csv_row_to_drug(row, i+2)
+                        if errs:
+                            all_errs.extend(errs)
+                        elif drug:
+                            records.append(drug)
+
+                    if all_errs:
+                        st.error("오류가 있는 행:\n" + "\n".join(all_errs))
+                    if records:
+                        with get_conn() as conn:
+                            n = _upsert(conn, records)
+                        st.success(f"✅ {n}개 약제가 DB에 반영됐습니다!")
+                        st.balloons()
+
         except Exception as e:
             st.error(f"파일 처리 오류: {e}")
-    st.subheader("템플릿 다운로드")
-    st.download_button("seed_data.json 내려받기", SEED_PATH.read_bytes(),
-                       file_name="drug_data_template.json", mime="application/json")
+
+    st.divider()
+
+    # ── 현재 DB 약제 목록 ──
+    st.subheader("📋 현재 등록된 약제 목록")
+    with get_conn() as conn:
+        df_db = pd.read_sql_query(
+            "SELECT name AS 약품명, ingredient_display AS 성분명, "
+            "reimbursement_code AS 급여코드, manufacturer AS 제조사, updated_at AS 업데이트일시 "
+            "FROM drugs ORDER BY updated_at DESC",
+            conn
+        )
+    if df_db.empty:
+        st.info("등록된 약제가 없습니다.")
+    else:
+        st.dataframe(df_db, hide_index=True, use_container_width=True)
+        # 현재 DB 전체 CSV 다운로드
+        st.download_button(
+            "📥 현재 DB 전체 CSV로 내려받기",
+            data=df_db.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+            file_name="claimlens_현재DB목록.csv",
+            mime="text/csv",
+        )
 
 
 # ─────────────────────────────────────────────
@@ -1195,8 +1587,8 @@ def sidebar_nav() -> tuple[str, str]:
     )
 
     st.sidebar.divider()
-    api_key = secret("PUBLIC_DATA_API_KEY")
-    ai_key  = secret("OPENAI_API_KEY")
+    api_key    = secret("PUBLIC_DATA_API_KEY")
+    gemini_key = secret("GEMINI_API_KEY")
 
     # API 상태
     st.sidebar.markdown("**🔑 API 키 상태**")
@@ -1204,11 +1596,11 @@ def sidebar_nav() -> tuple[str, str]:
         st.sidebar.markdown("✅ 공공데이터포털 API : 설정됨")
     else:
         st.sidebar.markdown("❌ 공공데이터포털 API : 미설정")
-        st.sidebar.caption("API 설정 메뉴에서 확인하세요")
-    if ai_key:
-        st.sidebar.markdown("✅ AI(OpenAI) : 설정됨")
+        st.sidebar.caption("🔌 API 설정 메뉴에서 확인하세요")
+    if gemini_key:
+        st.sidebar.markdown("✅ AI(Gemini) : 설정됨")
     else:
-        st.sidebar.markdown("❌ AI(OpenAI) : 미설정 (선택)")
+        st.sidebar.markdown("❌ AI(Gemini) : 미설정 (선택)")
 
     st.sidebar.divider()
     st.sidebar.markdown("**📋 데이터 운영 원칙**")

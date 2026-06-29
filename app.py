@@ -364,6 +364,23 @@ def is_api_success(header: dict) -> bool:
     return code in ("00", "0", "")
 
 
+def call_public_api(url: str, service_key: str, extra_params: dict) -> requests.Response:
+    """공공데이터포털 API 공통 호출.
+    serviceKey는 이미 URL-encoding된 키로 발급되는 경우가 많아,
+    requests.params로 넘기면 이중 인코딩되어 인증 실패(흔히 500)로 이어진다.
+    → serviceKey는 URL에 그대로 이어붙이고, 나머지 파라미터(한글 등 포함)는
+      urlencode로 정상 인코딩한다.
+    """
+    from urllib.parse import urlencode
+    qs = urlencode(extra_params)
+    full_url = f"{url}?serviceKey={service_key}&{qs}"
+    r = requests.get(full_url, timeout=API_TIMEOUT)
+    if r.status_code >= 400:
+        snippet = (r.text or "")[:200].replace("\n", " ")
+        raise ValueError(f"HTTP {r.status_code} 응답 / 본문: {snippet}")
+    return r
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def api_drug_price(drug_name: str, api_key: str) -> dict:
     """[15054445] HIRA 약가기준정보조회서비스 - 약가목록조회
@@ -374,15 +391,13 @@ def api_drug_price(drug_name: str, api_key: str) -> dict:
         return {"status":"skip","data":None}
     try:
         url = "https://apis.data.go.kr/B551182/dgamtCtrtInfoService1.2/getDgamtList"
-        params = {"serviceKey":api_key,"itemName":drug_name,"numOfRows":5,"pageNo":1}
-        r = requests.get(url, params=params, timeout=API_TIMEOUT)
-        r.raise_for_status()
+        r = call_public_api(url, api_key, {"itemName":drug_name,"numOfRows":5,"pageNo":1})
         items, header = parse_xml_items(r.text)
         if not is_api_success(header):
             return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
         return {"status":"ok","data":items[:3]}
     except Exception as e:
-        return {"status":"fail","error":str(e)[:80],"data":None}
+        return {"status":"fail","error":str(e)[:200],"data":None}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -395,9 +410,7 @@ def api_drug_permit(drug_name: str, api_key: str) -> dict:
         return {"status":"skip","data":None}
     try:
         url = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"
-        params = {"serviceKey":api_key,"type":"json","item_name":drug_name,"numOfRows":3,"pageNo":1}
-        r = requests.get(url, params=params, timeout=API_TIMEOUT)
-        r.raise_for_status()
+        r = call_public_api(url, api_key, {"type":"json","item_name":drug_name,"numOfRows":3,"pageNo":1})
         ctype = r.headers.get("content-type","")
         if "json" in ctype:
             body = r.json().get("body",{})
@@ -410,7 +423,7 @@ def api_drug_permit(drug_name: str, api_key: str) -> dict:
                 return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
         return {"status":"ok","data":items[:2]}
     except Exception as e:
-        return {"status":"fail","error":str(e)[:80],"data":None}
+        return {"status":"fail","error":str(e)[:200],"data":None}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -419,17 +432,15 @@ def api_drug_eiyak(drug_name: str, api_key: str) -> dict:
     if not api_key:
         return {"status":"skip","data":None}
     try:
-        url = "http://apis.data.go.kr/1471000/DrbEasyDrugInfoService/getDrbEasyDrugList"
-        params = {"serviceKey":api_key,"type":"json","itemName":drug_name,"numOfRows":3,"pageNo":1}
-        r = requests.get(url, params=params, timeout=API_TIMEOUT)
-        r.raise_for_status()
+        url = "https://apis.data.go.kr/1471000/DrbEasyDrugInfoService/getDrbEasyDrugList"
+        r = call_public_api(url, api_key, {"type":"json","itemName":drug_name,"numOfRows":3,"pageNo":1})
         body = r.json().get("body",{})
         items = body.get("items",[]) or []
         if isinstance(items, dict):
             items = [items] if items else []
         return {"status":"ok","data":items[:2]}
     except Exception as e:
-        return {"status":"fail","error":str(e)[:80],"data":None}
+        return {"status":"fail","error":str(e)[:200],"data":None}
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -438,17 +449,15 @@ def api_disease_search(keyword: str, api_key: str) -> dict:
     if not api_key:
         return {"status":"skip","data":None}
     try:
-        url = "http://apis.data.go.kr/B551182/diseaseInfoService/getDissNameCodeList"
-        params = {"serviceKey":api_key,"type":"json","disNm":keyword,"numOfRows":20,"pageNo":1}
-        r = requests.get(url, params=params, timeout=API_TIMEOUT)
-        r.raise_for_status()
+        url = "https://apis.data.go.kr/B551182/diseaseInfoService/getDissNameCodeList"
+        r = call_public_api(url, api_key, {"type":"json","disNm":keyword,"numOfRows":20,"pageNo":1})
         body = r.json().get("body",{})
         items = body.get("items",[]) or []
         if isinstance(items, dict):
             items = [items.get("item")] if items.get("item") else []
         return {"status":"ok","data":items}
     except Exception as e:
-        return {"status":"fail","error":str(e)[:80],"data":None}
+        return {"status":"fail","error":str(e)[:200],"data":None}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -462,15 +471,13 @@ def api_review_criteria(drug_code: str, api_key: str) -> dict:
         return {"status":"skip","data":None}
     try:
         url = "https://apis.data.go.kr/B551182/mdfeeCtrtInfoService/getPharmacyMdfeeList"
-        params = {"serviceKey":api_key,"mdfeeCd":drug_code,"numOfRows":10,"pageNo":1}
-        r = requests.get(url, params=params, timeout=API_TIMEOUT)
-        r.raise_for_status()
+        r = call_public_api(url, api_key, {"mdfeeCd":drug_code,"numOfRows":10,"pageNo":1})
         items, header = parse_xml_items(r.text)
         if not is_api_success(header):
             return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
         return {"status":"ok","data":items}
     except Exception as e:
-        return {"status":"fail","error":str(e)[:80],"data":None}
+        return {"status":"fail","error":str(e)[:200],"data":None}
 
 
 def api_badge(status: str) -> str:

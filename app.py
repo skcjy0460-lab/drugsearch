@@ -364,21 +364,47 @@ def is_api_success(header: dict) -> bool:
     return code in ("00", "0", "")
 
 
-def call_public_api(url: str, service_key: str, extra_params: dict) -> requests.Response:
+def call_public_api(url: str, service_key: str, extra_params: dict, debug_label: str = "") -> requests.Response:
     """공공데이터포털 API 공통 호출.
     serviceKey는 이미 URL-encoding된 키로 발급되는 경우가 많아,
     requests.params로 넘기면 이중 인코딩되어 인증 실패(흔히 500)로 이어진다.
     → serviceKey는 URL에 그대로 이어붙이고, 나머지 파라미터(한글 등 포함)는
       urlencode로 정상 인코딩한다.
+    디버그 정보(요청 URL 마스킹본, 상태코드, 응답 본문)는 세션 상태에 누적 저장한다.
     """
     from urllib.parse import urlencode
     qs = urlencode(extra_params)
     full_url = f"{url}?serviceKey={service_key}&{qs}"
-    r = requests.get(full_url, timeout=API_TIMEOUT)
+    masked_url = f"{url}?serviceKey={service_key[:6]}...{service_key[-4:]}&{qs}" if len(service_key) > 12 else full_url
+
+    debug_entry = {"label": debug_label, "url": masked_url, "key_len": len(service_key)}
+
+    try:
+        r = requests.get(full_url, timeout=API_TIMEOUT)
+    except Exception as e:
+        debug_entry["exception"] = str(e)
+        _push_debug(debug_entry)
+        raise
+
+    debug_entry["status_code"] = r.status_code
+    debug_entry["response_snippet"] = (r.text or "")[:500]
+    debug_entry["response_headers_ctype"] = r.headers.get("content-type", "")
+    _push_debug(debug_entry)
+
     if r.status_code >= 400:
-        snippet = (r.text or "")[:200].replace("\n", " ")
+        snippet = (r.text or "")[:300].replace("\n", " ")
         raise ValueError(f"HTTP {r.status_code} 응답 / 본문: {snippet}")
     return r
+
+
+_API_DEBUG_LOG: list[dict] = []
+
+
+def _push_debug(entry: dict) -> None:
+    """캐시된 함수(@st.cache_data) 내부에서도 안전하게 동작하도록
+    st.session_state 대신 모듈 전역 리스트에 저장한다."""
+    _API_DEBUG_LOG.append(entry)
+    del _API_DEBUG_LOG[:-10]  # 최근 10건만 유지
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -391,7 +417,7 @@ def api_drug_price(drug_name: str, api_key: str) -> dict:
         return {"status":"skip","data":None}
     try:
         url = "https://apis.data.go.kr/B551182/dgamtCtrtInfoService1.2/getDgamtList"
-        r = call_public_api(url, api_key, {"itemName":drug_name,"numOfRows":5,"pageNo":1})
+        r = call_public_api(url, api_key, {"itemName":drug_name,"numOfRows":5,"pageNo":1}, "약가기준정보")
         items, header = parse_xml_items(r.text)
         if not is_api_success(header):
             return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
@@ -410,7 +436,7 @@ def api_drug_permit(drug_name: str, api_key: str) -> dict:
         return {"status":"skip","data":None}
     try:
         url = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"
-        r = call_public_api(url, api_key, {"type":"json","item_name":drug_name,"numOfRows":3,"pageNo":1})
+        r = call_public_api(url, api_key, {"type":"json","item_name":drug_name,"numOfRows":3,"pageNo":1}, "허가정보")
         ctype = r.headers.get("content-type","")
         if "json" in ctype:
             body = r.json().get("body",{})
@@ -433,7 +459,7 @@ def api_drug_eiyak(drug_name: str, api_key: str) -> dict:
         return {"status":"skip","data":None}
     try:
         url = "https://apis.data.go.kr/1471000/DrbEasyDrugInfoService/getDrbEasyDrugList"
-        r = call_public_api(url, api_key, {"type":"json","itemName":drug_name,"numOfRows":3,"pageNo":1})
+        r = call_public_api(url, api_key, {"type":"json","itemName":drug_name,"numOfRows":3,"pageNo":1}, "e약은요")
         body = r.json().get("body",{})
         items = body.get("items",[]) or []
         if isinstance(items, dict):
@@ -450,7 +476,7 @@ def api_disease_search(keyword: str, api_key: str) -> dict:
         return {"status":"skip","data":None}
     try:
         url = "https://apis.data.go.kr/B551182/diseaseInfoService/getDissNameCodeList"
-        r = call_public_api(url, api_key, {"type":"json","disNm":keyword,"numOfRows":20,"pageNo":1})
+        r = call_public_api(url, api_key, {"type":"json","disNm":keyword,"numOfRows":20,"pageNo":1}, "질병정보")
         body = r.json().get("body",{})
         items = body.get("items",[]) or []
         if isinstance(items, dict):
@@ -471,7 +497,7 @@ def api_review_criteria(drug_code: str, api_key: str) -> dict:
         return {"status":"skip","data":None}
     try:
         url = "https://apis.data.go.kr/B551182/mdfeeCtrtInfoService/getPharmacyMdfeeList"
-        r = call_public_api(url, api_key, {"mdfeeCd":drug_code,"numOfRows":10,"pageNo":1})
+        r = call_public_api(url, api_key, {"mdfeeCd":drug_code,"numOfRows":10,"pageNo":1}, "수가기준정보")
         items, header = parse_xml_items(r.text)
         if not is_api_success(header):
             return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
@@ -828,6 +854,13 @@ def render_icd_section(drug: dict, api_key: str) -> None:
 # ─────────────────────────────────────────────
 def render_drug_detail(drug: dict, api_key: str) -> None:
 
+    col_title, col_clear = st.columns([5,1])
+    with col_clear:
+        if st.button("🔄 API 새로고침", key=f"clear-cache-{drug['id']}", help="캐시된 API 결과를 지우고 다시 호출합니다"):
+            st.cache_data.clear()
+            _API_DEBUG_LOG.clear()
+            st.rerun()
+
     # ── API 데이터 일괄 조회 ──
     with st.spinner("공공 API 데이터 조회 중..."):
         price_res  = api_drug_price(drug.get("name",""), api_key)
@@ -886,6 +919,22 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
             for name, res in fails:
                 st.markdown(f"**{name}**")
                 st.code(res.get("error","알 수 없는 오류"), language="text")
+
+    # ── 원시 요청/응답 디버그 로그 ──
+    debug_log = _API_DEBUG_LOG
+    if debug_log:
+        with st.expander(f"🔧 API 요청·응답 원본 로그 (최근 {len(debug_log)}건) — 정확한 진단용"):
+            st.caption("이 패널 내용을 그대로 캡처해서 보내주시면 정확한 원인을 바로 찾을 수 있습니다.")
+            for i, entry in enumerate(reversed(debug_log), 1):
+                st.markdown(f"**{i}. {entry.get('label','')}**")
+                st.code(
+                    f"요청 URL: {entry.get('url','')}\n"
+                    f"키 길이: {entry.get('key_len','')}자\n"
+                    f"상태코드: {entry.get('status_code', entry.get('exception','(요청 자체 실패)'))}\n"
+                    f"응답 Content-Type: {entry.get('response_headers_ctype','')}\n"
+                    f"응답 본문(앞 500자):\n{entry.get('response_snippet','')}",
+                    language="text"
+                )
 
     # ── 약가 정보 (API 우선) ──
     price_str  = drug.get("upper_price","공식 목록 확인")

@@ -322,20 +322,64 @@ def get_api_key() -> str:
     return secret("PUBLIC_DATA_API_KEY")
 
 
+def parse_xml_items(xml_text: str) -> tuple[list[dict], dict]:
+    """공공데이터포털 표준 XML 응답(header/body/items/item) 파싱.
+    반환: (item dict 리스트, header dict)
+    서비스키 오류 등은 <cmmMsgHeader> 구조로 오므로 별도 감지해 예외 발생.
+    """
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        snippet = (xml_text or "")[:120].replace("\n", " ")
+        raise ValueError(f"XML 파싱 실패: {e} / 응답앞부분: {snippet}")
+
+    # 공통 오류 응답 구조 (서비스키 미등록/한도초과 등)
+    err_el = root.find(".//cmmMsgHeader")
+    if err_el is not None:
+        err_msg = (err_el.findtext("errMsg") or "").strip()
+        auth_msg = (err_el.findtext("returnAuthMsg") or "").strip()
+        raise ValueError(f"인증/요청 오류: {err_msg} {auth_msg}".strip())
+
+    header = {}
+    header_el = root.find(".//header")
+    if header_el is not None:
+        for child in header_el:
+            header[child.tag] = (child.text or "").strip()
+
+    items = []
+    for item_el in root.findall(".//items/item"):
+        d = {}
+        for child in item_el:
+            d[child.tag] = (child.text or "").strip()
+        items.append(d)
+    return items, header
+
+
+def is_api_success(header: dict) -> bool:
+    """resultCode가 00이면 정상. header가 비어있으면(다른 스펙) True로 간주."""
+    if not header:
+        return True
+    code = header.get("resultCode", "")
+    return code in ("00", "0", "")
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def api_drug_price(drug_name: str, api_key: str) -> dict:
-    """[15054445] HIRA 약가기준정보 - 상한금액·급여여부"""
+    """[15054445] HIRA 약가기준정보조회서비스 - 약가목록조회
+    End Point(확인됨): https://apis.data.go.kr/B551182/dgamtCtrtInfoService1.2/getDgamtList
+    데이터포맷: XML
+    """
     if not api_key:
         return {"status":"skip","data":None}
     try:
-        url = "http://apis.data.go.kr/B551182/msInsrdMdctnPrscbInfoService/getInsrdMdctnPrscbInfo"
-        params = {"serviceKey":api_key,"type":"json","itmNm":drug_name,"numOfRows":5,"pageNo":1}
+        url = "https://apis.data.go.kr/B551182/dgamtCtrtInfoService1.2/getDgamtList"
+        params = {"serviceKey":api_key,"itemName":drug_name,"numOfRows":5,"pageNo":1}
         r = requests.get(url, params=params, timeout=API_TIMEOUT)
         r.raise_for_status()
-        body = r.json().get("body",{})
-        items = body.get("items",[]) or []
-        if isinstance(items, dict):
-            items = [items.get("item",{})] if items.get("item") else []
+        items, header = parse_xml_items(r.text)
+        if not is_api_success(header):
+            return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
         return {"status":"ok","data":items[:3]}
     except Exception as e:
         return {"status":"fail","error":str(e)[:80],"data":None}
@@ -343,18 +387,27 @@ def api_drug_price(drug_name: str, api_key: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def api_drug_permit(drug_name: str, api_key: str) -> dict:
-    """[15095677] 식약처 의약품 제품 허가정보 - 적응증·허가사항"""
+    """[15095677] 식약처 의약품 제품 허가정보 - 의약품 제품 허가 상세정보
+    End Point(확인됨): https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06
+    데이터포맷: JSON+XML (type=json 요청 가능)
+    """
     if not api_key:
         return {"status":"skip","data":None}
     try:
-        url = "http://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService06/getDrugPrdtPrmsnDtlInq06"
+        url = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"
         params = {"serviceKey":api_key,"type":"json","item_name":drug_name,"numOfRows":3,"pageNo":1}
         r = requests.get(url, params=params, timeout=API_TIMEOUT)
         r.raise_for_status()
-        body = r.json().get("body",{})
-        items = body.get("items",[]) or []
-        if isinstance(items, dict):
-            items = [items] if items else []
+        ctype = r.headers.get("content-type","")
+        if "json" in ctype:
+            body = r.json().get("body",{})
+            items = body.get("items",[]) or []
+            if isinstance(items, dict):
+                items = [items.get("item",{})] if items.get("item") else (items if items else [])
+        else:
+            items, header = parse_xml_items(r.text)
+            if not is_api_success(header):
+                return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
         return {"status":"ok","data":items[:2]}
     except Exception as e:
         return {"status":"fail","error":str(e)[:80],"data":None}
@@ -400,18 +453,21 @@ def api_disease_search(keyword: str, api_key: str) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def api_review_criteria(drug_code: str, api_key: str) -> dict:
-    """[15021028] HIRA 수가기준정보 - 심사기준"""
+    """[15021028] HIRA 수가기준정보조회서비스 - 약국수가목록조회
+    End Point(확인됨): https://apis.data.go.kr/B551182/mdfeeCtrtInfoService/getPharmacyMdfeeList
+    데이터포맷: XML
+    설명: 수가코드·분류번호·수가한글명을 통해 약국수가 조회 (급여코드를 수가코드로 사용)
+    """
     if not api_key or not drug_code:
         return {"status":"skip","data":None}
     try:
-        url = "http://apis.data.go.kr/B551182/msInsrdMdctnPrscbInfoService/getInsrdMdctnPrscbInfo"
-        params = {"serviceKey":api_key,"type":"json","ediCd":drug_code,"numOfRows":10,"pageNo":1}
+        url = "https://apis.data.go.kr/B551182/mdfeeCtrtInfoService/getPharmacyMdfeeList"
+        params = {"serviceKey":api_key,"mdfeeCd":drug_code,"numOfRows":10,"pageNo":1}
         r = requests.get(url, params=params, timeout=API_TIMEOUT)
         r.raise_for_status()
-        body = r.json().get("body",{})
-        items = body.get("items",[]) or []
-        if isinstance(items, dict):
-            items = [items] if items else []
+        items, header = parse_xml_items(r.text)
+        if not is_api_success(header):
+            return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
         return {"status":"ok","data":items}
     except Exception as e:
         return {"status":"fail","error":str(e)[:80],"data":None}
@@ -795,7 +851,7 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
       <div class="api-row">
         <span class="ap-name">[15021028] 수가기준정보</span>
         {api_badge(review_res['status'])}
-        <span style="font-size:.74rem;color:#557068;">심사기준</span>
+        <span style="font-size:.74rem;color:#557068;">약국수가 조회</span>
       </div>
       <div class="api-row">
         <span class="ap-name">[15119055] 질병정보</span>
@@ -810,6 +866,19 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
       </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── 실패한 API의 오류 상세 (디버깅용) ──
+    fail_list = [
+        ("[15054445] 약가기준정보", price_res),
+        ("[15095677] 의약품 허가정보", permit_res),
+        ("[15021028] 수가기준정보", review_res),
+    ]
+    fails = [(name, res) for name, res in fail_list if res.get("status") == "fail"]
+    if fails:
+        with st.expander(f"⚠️ 연동 실패 상세 보기 ({len(fails)}건) — 클릭해서 원인 확인"):
+            for name, res in fails:
+                st.markdown(f"**{name}**")
+                st.code(res.get("error","알 수 없는 오류"), language="text")
 
     # ── 약가 정보 (API 우선) ──
     price_str  = drug.get("upper_price","공식 목록 확인")
@@ -1138,13 +1207,18 @@ def page_api_guide() -> None:
     )
 
     apis = [
-        ("약가기준정보","15054445","HIRA","상한금액·급여여부"),
-        ("질병정보서비스","15119055","HIRA","KCD 상병코드 검색"),
-        ("수가기준정보","15021028","HIRA","진료행위 심사기준"),
-        ("의약품 제품 허가정보","15095677","식약처","적응증·허가사항"),
-        ("의약품개요정보(e약은요)","15075057","식약처","효능·용법·주의·금기"),
+        ("약가기준정보","15054445","HIRA","상한금액·급여여부",
+         "B551182/dgamtCtrtInfoService1.2/getDgamtList"),
+        ("질병정보서비스","15119055","HIRA","KCD 상병코드 검색",
+         "B551182/diseaseInfoService/getDissNameCodeList"),
+        ("수가기준정보","15021028","HIRA","약국수가 조회",
+         "B551182/mdfeeCtrtInfoService/getPharmacyMdfeeList"),
+        ("의약품 제품 허가정보","15095677","식약처","적응증·허가사항",
+         "1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"),
+        ("의약품개요정보(e약은요)","15075057","식약처","효능·용법·주의·금기",
+         "1471000/DrbEasyDrugInfoService/getDrbEasyDrugList"),
     ]
-    for name, num, org, desc in apis:
+    for name, num, org, desc, endpoint in apis:
         st.markdown(f"""
         <div class="ref-card ref-공식" style="margin-bottom:.4rem;">
           <div style="font-weight:800;color:#152622;">{name}
@@ -1153,8 +1227,13 @@ def page_api_guide() -> None:
           <div style="font-size:.86rem;color:#3a5550;margin-top:.2rem;">
             기관: <strong>{org}</strong> &nbsp;|&nbsp; 제공: {desc}
           </div>
+          <div style="font-size:.76rem;color:#7a8d88;margin-top:.3rem;font-family:monospace;">
+            {endpoint}
+          </div>
         </div>
         """, unsafe_allow_html=True)
+
+    st.caption("ℹ️ 위 End Point는 신청한 계정의 '개발계정 상세보기' 화면에서 직접 확인·대조된 값입니다.")
 
     # ── Gemini AI 안내 ──
     st.markdown("### 🤖 AI 기능 (Google Gemini 무료)")

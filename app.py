@@ -407,21 +407,38 @@ def _push_debug(entry: dict) -> None:
     del _API_DEBUG_LOG[:-10]  # 최근 10건만 유지
 
 
+def call_odcloud_api(uddi_path: str, service_key: str, extra_params: dict, debug_label: str = "") -> dict:
+    """공공데이터포털 odcloud.kr 표준 파일데이터 API 공통 호출.
+    Base URL: https://api.odcloud.kr/api
+    응답 구조: {page, perPage, totalCount, currentCount, matchCount, data:[...]}
+    페이지당 최대 perPage가 제한적이므로(보통 100), 필요한 만큼만 조회한다.
+    """
+    url = f"https://api.odcloud.kr/api/{uddi_path}"
+    r = call_public_api(url, service_key, extra_params, debug_label)
+    try:
+        return r.json()
+    except Exception as e:
+        snippet = (r.text or "")[:200].replace("\n", " ")
+        raise ValueError(f"JSON 파싱 실패: {e} / 응답: {snippet}")
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def api_drug_price(drug_name: str, api_key: str) -> dict:
-    """[15054445] HIRA 약가기준정보조회서비스 - 약가목록조회
-    End Point(확인됨): https://apis.data.go.kr/B551182/dgamtCtrtInfoService1.2/getDgamtList
-    데이터포맷: XML
+def api_drug_price(drug_name: str, ingredient_display: str, api_key: str) -> dict:
+    """[15067461] HIRA 약가마스터_의약품주성분 (odcloud 파일데이터 API)
+    Swagger 확인됨: /15067461/v1/uddi:d4fe1f12-a1e9-45c6-a04a-c0cacefd6de2 (20251031 최신본)
+    응답 필드: 일반명코드, 제형구분코드, 제형, 일반명, 분류번호, 투여, 함량, 단위
+    검색 파라미터가 없는 페이지네이션 전용 API라, 일반명(성분명) 일부 일치로 클라이언트 필터링한다.
     """
     if not api_key:
         return {"status":"skip","data":None}
     try:
-        url = "https://apis.data.go.kr/B551182/dgamtCtrtInfoService1.2/getDgamtList"
-        r = call_public_api(url, api_key, {"itemName":drug_name,"numOfRows":5,"pageNo":1}, "약가기준정보")
-        items, header = parse_xml_items(r.text)
-        if not is_api_success(header):
-            return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
-        return {"status":"ok","data":items[:3]}
+        uddi = "15067461/v1/uddi:d4fe1f12-a1e9-45c6-a04a-c0cacefd6de2"
+        # 성분명 핵심 키워드(첫 단어, 영문/한글 앞부분)로 넓게 가져와서 클라이언트에서 매칭
+        keyword = (ingredient_display or drug_name or "").split()[0] if (ingredient_display or drug_name) else ""
+        resp = call_odcloud_api(uddi, api_key, {"page":1,"perPage":100}, "약가마스터_의약품주성분")
+        all_items = resp.get("data", [])
+        matched = [it for it in all_items if keyword and keyword.lower() in str(it.get("일반명","")).lower()]
+        return {"status":"ok","data":(matched or all_items)[:5], "total": resp.get("totalCount", 0)}
     except Exception as e:
         return {"status":"fail","error":str(e)[:200],"data":None}
 
@@ -486,22 +503,50 @@ def api_disease_search(keyword: str, api_key: str) -> dict:
         return {"status":"fail","error":str(e)[:200],"data":None}
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def api_review_criteria(drug_code: str, api_key: str) -> dict:
-    """[15021028] HIRA 수가기준정보조회서비스 - 약국수가목록조회
-    End Point(확인됨): https://apis.data.go.kr/B551182/mdfeeCtrtInfoService/getPharmacyMdfeeList
-    데이터포맷: XML
-    설명: 수가코드·분류번호·수가한글명을 통해 약국수가 조회 (급여코드를 수가코드로 사용)
+@st.cache_data(ttl=86400, show_spinner=False)
+def api_disease_master_search(keyword: str, api_key: str) -> dict:
+    """[15067467] HIRA 상병마스터 (odcloud 파일데이터 API) - 정식 KCD 마스터
+    Swagger 확인됨: /15067467/v1/uddi:0add74e2-fe8c-4807-b300-814233aad8ea (20250930 최신본)
+    응답 필드: 상병기호, 한글명, 영문명, 완전코드구분, 주상병사용구분, 법정감염병구분,
+              성별구분, 상한연령, 하한연령, 양한방구분
+    한글명 일부 일치로 클라이언트 필터링한다. (검색 전용 파라미터가 없는 페이지네이션 API)
+    호출 횟수를 줄이기 위해 perPage를 크게 잡아 1~2회 호출로 매칭을 시도한다.
     """
-    if not api_key or not drug_code:
+    if not api_key or not keyword:
         return {"status":"skip","data":None}
     try:
-        url = "https://apis.data.go.kr/B551182/mdfeeCtrtInfoService/getPharmacyMdfeeList"
-        r = call_public_api(url, api_key, {"mdfeeCd":drug_code,"numOfRows":10,"pageNo":1}, "수가기준정보")
-        items, header = parse_xml_items(r.text)
-        if not is_api_success(header):
-            return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
-        return {"status":"ok","data":items}
+        uddi = "15067467/v1/uddi:0add74e2-fe8c-4807-b300-814233aad8ea"
+        matched = []
+        for page in range(1, 4):  # perPage=1000 기준 최대 3페이지(3000건)까지만 탐색
+            resp = call_odcloud_api(uddi, api_key, {"page":page,"perPage":1000}, "상병마스터")
+            page_items = resp.get("data", [])
+            if not page_items:
+                break
+            matched.extend([it for it in page_items if keyword in str(it.get("한글명",""))])
+            total = resp.get("totalCount", 0)
+            if len(matched) >= 20 or page * 1000 >= total:
+                break
+        return {"status":"ok","data":matched[:20]}
+    except Exception as e:
+        return {"status":"fail","error":str(e)[:200],"data":None}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def api_standard_code(drug_name: str, api_key: str) -> dict:
+    """[15067462] HIRA 약가마스터_의약품표준코드 (odcloud 파일데이터 API)
+    Swagger 확인됨: /15067462/v1/uddi:456729a5-28ed-494d-b5a8-ba5000eb6bab (20251031 최신본)
+    응답 필드: 한글상품명, 업체명, 약품규격, 표준코드, 품목기준코드, 전문일반구분, 국제표준코드(ATC코드) 등
+    한글상품명 일부 일치로 클라이언트 필터링한다.
+    """
+    if not api_key or not drug_name:
+        return {"status":"skip","data":None}
+    try:
+        uddi = "15067462/v1/uddi:456729a5-28ed-494d-b5a8-ba5000eb6bab"
+        keyword = drug_name[:6]  # 상품명 앞부분으로 넓게 매칭
+        resp = call_odcloud_api(uddi, api_key, {"page":1,"perPage":100}, "약가마스터_의약품표준코드")
+        all_items = resp.get("data", [])
+        matched = [it for it in all_items if keyword and keyword in str(it.get("한글상품명",""))]
+        return {"status":"ok","data":matched[:5], "total": resp.get("totalCount", 0)}
     except Exception as e:
         return {"status":"fail","error":str(e)[:200],"data":None}
 
@@ -806,18 +851,20 @@ def render_icd_section(drug: dict, api_key: str) -> None:
 
         # 직접 검색
         st.markdown("---")
-        st.markdown("**🔍 상병코드 직접 검색 (HIRA 질병정보 API)**")
+        st.markdown("**🔍 상병코드 직접 검색 (HIRA 상병마스터)**")
         c1, c2 = st.columns([5,1])
         kw = c1.text_input("상병명 키워드", placeholder="예: 폐렴, 고혈압, 방광염",
                             key=f"icd-kw-{drug['id']}", label_visibility="collapsed")
         do_srch = c2.button("검색", key=f"icd-btn-{drug['id']}", type="primary", use_container_width=True)
         if do_srch and kw.strip():
-            with st.spinner("HIRA 질병정보 조회 중..."):
-                res = api_disease_search(kw.strip(), api_key)
+            with st.spinner("HIRA 상병마스터 조회 중..."):
+                res = api_disease_master_search(kw.strip(), api_key)
             if res["status"] == "ok" and res["data"]:
+                st.caption(f"상병마스터 매칭 {len(res['data'])}건 (KCD 정식 마스터 기준)")
                 for item in res["data"]:
-                    code = item.get("disCode","") or item.get("disCd","")
-                    name = item.get("disNm","")
+                    code = item.get("상병기호","")
+                    name = item.get("한글명","")
+                    is_main = item.get("주상병사용구분","")
                     if code and name:
                         st.markdown(f"""
                         <div class="icd-card">
@@ -825,15 +872,35 @@ def render_icd_section(drug: dict, api_key: str) -> None:
                           <div class="icd-info">
                             <div class="icd-name">{esc(name)}</div>
                             <div style="margin-top:.3rem;">
-                              <span class="pill pill-blue">API 조회</span>
+                              <span class="pill pill-blue">상병마스터 조회</span>
+                              {f'<span class="pill pill-purple">주상병가능: {esc(is_main)}</span>' if is_main else ''}
                             </div>
                           </div>
                         </div>
                         """, unsafe_allow_html=True)
             elif res["status"] == "skip":
                 st.caption("API 키 설정 후 직접 검색이 활성화됩니다.")
+            elif res["status"] == "fail":
+                st.warning(f"상병마스터 조회 오류: {res.get('error','')}")
+                # 폴백: 기존 질병정보서비스로 재시도
+                st.caption("질병정보서비스(보조)로 재시도합니다...")
+                res2 = api_disease_search(kw.strip(), api_key)
+                if res2["status"] == "ok" and res2["data"]:
+                    for item in res2["data"]:
+                        code = item.get("disCode","") or item.get("disCd","")
+                        name = item.get("disNm","")
+                        if code and name:
+                            st.markdown(f"""
+                            <div class="icd-card">
+                              <div class="icd-code">{esc(code)}</div>
+                              <div class="icd-info">
+                                <div class="icd-name">{esc(name)}</div>
+                                <div style="margin-top:.3rem;"><span class="pill pill-blue">질병정보 조회(보조)</span></div>
+                              </div>
+                            </div>
+                            """, unsafe_allow_html=True)
             else:
-                st.warning(f"결과 없음 또는 오류: {res.get('error','')}")
+                st.info("일치하는 상병이 없습니다. 다른 키워드로 검색해보세요.")
 
         # Gemini AI 상병 검토
         if ai_ok():
@@ -863,10 +930,10 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
 
     # ── API 데이터 일괄 조회 ──
     with st.spinner("공공 API 데이터 조회 중..."):
-        price_res  = api_drug_price(drug.get("name",""), api_key)
+        price_res  = api_drug_price(drug.get("name",""), drug.get("ingredient_display",""), api_key)
         permit_res = api_drug_permit(drug.get("name",""), api_key)
         eiyak_res  = api_drug_eiyak(drug.get("name",""), api_key)
-        review_res = api_review_criteria(drug.get("reimbursement_code",""), api_key)
+        stdcode_res = api_standard_code(drug.get("name",""), api_key)
 
     # ── API 상태 패널 ──
     gemini_status = 'ok' if ai_ok() else 'skip'
@@ -874,9 +941,9 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
     <div class="api-panel">
       <div class="ap-title">🔌 공공데이터포털 API 연동 상태 (단일 키)</div>
       <div class="api-row">
-        <span class="ap-name">[15054445] 약가기준정보</span>
+        <span class="ap-name">[15067461] 약가마스터_의약품주성분</span>
         {api_badge(price_res['status'])}
-        <span style="font-size:.74rem;color:#557068;">상한금액·급여여부</span>
+        <span style="font-size:.74rem;color:#557068;">일반명·제형·함량 조회</span>
       </div>
       <div class="api-row">
         <span class="ap-name">[15095677] 의약품 허가정보</span>
@@ -889,14 +956,19 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
         <span style="font-size:.74rem;color:#557068;">효능·용법·주의·금기</span>
       </div>
       <div class="api-row">
-        <span class="ap-name">[15021028] 수가기준정보</span>
-        {api_badge(review_res['status'])}
-        <span style="font-size:.74rem;color:#557068;">약국수가 조회</span>
+        <span class="ap-name">[15067462] 약가마스터_의약품표준코드</span>
+        {api_badge(stdcode_res['status'])}
+        <span style="font-size:.74rem;color:#557068;">표준코드(KD코드)·ATC코드 조회</span>
       </div>
       <div class="api-row">
         <span class="ap-name">[15119055] 질병정보</span>
         {api_badge('ok' if api_key else 'skip')}
         <span style="font-size:.74rem;color:#557068;">상병코드 직접 검색</span>
+      </div>
+      <div class="api-row">
+        <span class="ap-name">[15067467] 상병마스터</span>
+        {api_badge('ok' if api_key else 'skip')}
+        <span style="font-size:.74rem;color:#557068;">정식 KCD 상병코드 마스터 검색</span>
       </div>
       <div style="border-top:1px solid #dce8e5;margin:.5rem 0;"></div>
       <div class="api-row">
@@ -909,9 +981,9 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
 
     # ── 실패한 API의 오류 상세 (디버깅용) ──
     fail_list = [
-        ("[15054445] 약가기준정보", price_res),
+        ("[15067461] 약가마스터_의약품주성분", price_res),
         ("[15095677] 의약품 허가정보", permit_res),
-        ("[15021028] 수가기준정보", review_res),
+        ("[15067462] 약가마스터_의약품표준코드", stdcode_res),
     ]
     fails = [(name, res) for name, res in fail_list if res.get("status") == "fail"]
     if fails:
@@ -936,13 +1008,15 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
                     language="text"
                 )
 
-    # ── 약가 정보 (API 우선) ──
+    # ── 약가 정보 ──
+    # 주의: 약가마스터_의약품주성분 API는 상한금액(원)을 제공하지 않고
+    # 일반명·제형·함량·투여경로 등 "성분 마스터" 정보만 제공한다.
+    # 상한금액은 자체 DB(엑셀 적재분)의 upper_price를 그대로 사용한다.
     price_str  = drug.get("upper_price","공식 목록 확인")
     price_date = drug.get("price_effective_date","-")
+    master_match = None
     if price_res["status"] == "ok" and price_res["data"]:
-        i0 = price_res["data"][0]
-        price_str  = i0.get("uprcAmt","") or i0.get("mktPrc","") or price_str
-        price_date = i0.get("acptDt","") or i0.get("applyDt","") or price_date
+        master_match = price_res["data"][0]
 
     # ── 약제 헤더 ──
     status_cls = "pill-amber" if any(k in drug.get("status","") for k in ["검토","예시"]) else "pill-green"
@@ -993,6 +1067,25 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
       </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── 공공 API 보조 확인 정보 (약가마스터·표준코드 마스터 일치 결과) ──
+    api_match_notes = []
+    if master_match:
+        api_match_notes.append(
+            f"약가마스터(의약품주성분) 일치: 일반명 \"{esc(master_match.get('일반명',''))}\" "
+            f"· {esc(master_match.get('제형',''))} · {esc(master_match.get('함량',''))}{esc(master_match.get('단위',''))} "
+            f"· 투여 {esc(master_match.get('투여',''))}"
+        )
+    if stdcode_res["status"] == "ok" and stdcode_res["data"]:
+        s0 = stdcode_res["data"][0]
+        api_match_notes.append(
+            f"표준코드마스터 일치: {esc(s0.get('한글상품명',''))} · 표준코드 {esc(str(s0.get('표준코드','')))} "
+            f"· ATC코드 {esc(s0.get('국제표준코드(ATC코드)','') or s0.get('ATC코드',''))}"
+        )
+    if api_match_notes:
+        notes_html = "<br>".join(api_match_notes)
+        st.markdown(f'<div class="nb nb-ok">✅ 공공 API 마스터 데이터 일치 확인<br>{notes_html}</div>',
+                    unsafe_allow_html=True)
 
     st.markdown(
         '<div class="nb nb-warn">⚠️ 이 서비스는 청구심사 검토 보조용입니다. '
@@ -1071,11 +1164,11 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
     with st.container(border=True):
         st.markdown('<div class="sec-eyebrow">CLAIM REVIEW REFERENCES</div>'
                     '<div class="sec-title">📌 심사참고자료</div>', unsafe_allow_html=True)
-        if review_res["status"] == "ok" and review_res["data"]:
-            st.markdown(f'<span class="api-badge api-ok">● HIRA 수가기준 API 연동</span>',
+        if stdcode_res["status"] == "ok" and stdcode_res["data"]:
+            st.markdown(f'<span class="api-badge api-ok">● HIRA 약가마스터(표준코드) API 연동</span>',
                         unsafe_allow_html=True)
-            with st.expander("심사기준 API 원문"):
-                for item in review_res["data"][:3]: st.json(item)
+            with st.expander("표준코드마스터 API 원문"):
+                for item in stdcode_res["data"][:3]: st.json(item)
         refs = drug.get("review_references",[])
         if refs:
             for ref in refs:
@@ -1263,12 +1356,14 @@ def page_api_guide() -> None:
     )
 
     apis = [
-        ("약가기준정보","15054445","HIRA","상한금액·급여여부",
-         "B551182/dgamtCtrtInfoService1.2/getDgamtList"),
-        ("질병정보서비스","15119055","HIRA","KCD 상병코드 검색",
+        ("약가마스터_의약품주성분","15067461","HIRA(odcloud)","일반명·제형·함량·투여경로",
+         "odcloud.kr/api/15067461/v1/uddi:d4fe1f12...(20251031)"),
+        ("약가마스터_의약품표준코드","15067462","HIRA(odcloud)","표준코드(KD코드)·ATC코드",
+         "odcloud.kr/api/15067462/v1/uddi:456729a5...(20251031)"),
+        ("상병마스터","15067467","HIRA(odcloud)","정식 KCD 상병코드 전체 마스터",
+         "odcloud.kr/api/15067467/v1/uddi:0add74e2...(20250930)"),
+        ("질병정보서비스","15119055","HIRA","KCD 상병코드 검색(보조)",
          "B551182/diseaseInfoService/getDissNameCodeList"),
-        ("수가기준정보","15021028","HIRA","약국수가 조회",
-         "B551182/mdfeeCtrtInfoService/getPharmacyMdfeeList"),
         ("의약품 제품 허가정보","15095677","식약처","적응증·허가사항",
          "1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"),
         ("의약품개요정보(e약은요)","15075057","식약처","효능·용법·주의·금기",
@@ -1289,7 +1384,13 @@ def page_api_guide() -> None:
         </div>
         """, unsafe_allow_html=True)
 
-    st.caption("ℹ️ 위 End Point는 신청한 계정의 '개발계정 상세보기' 화면에서 직접 확인·대조된 값입니다.")
+    st.caption("ℹ️ 위 End Point는 신청한 계정의 Swagger 문서(infuser.odcloud.kr)에서 직접 확인·대조된 값입니다.")
+    st.markdown(
+        '<div class="nb nb-info">ℹ️ <strong>참고:</strong> 약가마스터_의약품주성분/표준코드는 실시간 상한금액(원)을 '
+        '제공하지 않습니다. 상한금액·급여여부는 자체 DB(엑셀 적재 데이터)를 기준으로 표시하고, '
+        '이 두 API는 일반명·제형·함량·표준코드·ATC코드 등 마스터 정보 보조 확인용으로 사용합니다.</div>',
+        unsafe_allow_html=True
+    )
 
     # ── Gemini AI 안내 ──
     st.markdown("### 🤖 AI 기능 (Google Gemini 무료)")

@@ -1116,20 +1116,42 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
     with st.container(border=True):
         st.markdown('<div class="sec-eyebrow">DOSAGE · AI ASSIST</div>'
                     '<div class="sec-title">💊 용법용량</div>', unsafe_allow_html=True)
-        if eiyak_res["status"] == "ok" and eiyak_res["data"]:
-            val = clean_html(eiyak_res["data"][0].get("useMethodQesitm",""))
-            if val:
-                st.markdown(f'<span class="api-badge api-ok">● e약은요 API 실시간</span>',
-                            unsafe_allow_html=True)
-                st.info(val[:600])
+        found_dosage = False
         if permit_res["status"] == "ok" and permit_res["data"]:
             ud = clean_html(permit_res["data"][0].get("UD_DOC_DATA","") or
                             permit_res["data"][0].get("ud_doc_data",""))
             if ud:
-                with st.expander("📡 식약처 허가정보 용법용량 전문"):
-                    st.write(ud[:800])
+                found_dosage = True
+                st.markdown(f'<span class="api-badge api-ok">● 식약처 허가정보 API 실시간</span>',
+                            unsafe_allow_html=True)
+                st.info(ud[:800])
+        if eiyak_res["status"] == "ok" and eiyak_res["data"]:
+            val = clean_html(eiyak_res["data"][0].get("useMethodQesitm",""))
+            if val:
+                found_dosage = True
+                st.markdown(f'<span class="api-badge api-ok">● e약은요 API 실시간 (일반의약품)</span>',
+                            unsafe_allow_html=True)
+                with st.expander("e약은요 용법용량 보기" if found_dosage else "용법용량"):
+                    st.write(val[:600])
+        if not found_dosage:
+            if permit_res["status"] == "skip" and eiyak_res["status"] == "skip":
+                st.caption("ℹ️ 공공데이터포털 API 키 미설정 — API 설정 메뉴에서 등록하면 자동으로 채워집니다.")
+            elif drug.get("professional") == "전문의약품":
+                st.markdown(
+                    '<div class="nb nb-info">ℹ️ 이 약은 전문의약품입니다. '
+                    'e약은요(15075057) API는 일반의약품만 제공하여 결과가 없을 수 있습니다. '
+                    '허가정보(15095677) API에서도 해당 항목을 찾지 못했습니다. '
+                    '식약처 의약품안전나라 또는 첨부문서로 직접 확인이 필요합니다.</div>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.caption("ℹ️ API에서 해당 약품의 용법용량 정보를 찾지 못했습니다.")
         st.markdown("**📋 등록 데이터**")
-        for item in drug.get("dosage_official",[]): st.markdown(f"- {item}")
+        local_dosage = drug.get("dosage_official",[])
+        if local_dosage:
+            for item in local_dosage: st.markdown(f"- {item}")
+        else:
+            st.caption("등록된 자체 DB 데이터 없음")
         st.markdown("**🤖 AI 체크리스트**")
         for item in drug.get("dosage_ai_checklist",[]): st.markdown(f"- {item}")
         if ai_ok():
@@ -1144,20 +1166,40 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
     with st.container(border=True):
         st.markdown('<div class="sec-eyebrow">INDICATIONS & EFFICACY</div>'
                     '<div class="sec-title">✅ 효능효과</div>', unsafe_allow_html=True)
-        if eiyak_res["status"] == "ok" and eiyak_res["data"]:
-            val = clean_html(eiyak_res["data"][0].get("efcyQesitm",""))
-            if val:
-                st.markdown(f'<span class="api-badge api-ok">● e약은요 API</span>',
-                            unsafe_allow_html=True)
-                st.markdown(f"> {val[:500]}")
+        found_efficacy = False
         if permit_res["status"] == "ok" and permit_res["data"]:
             ee = clean_html(permit_res["data"][0].get("EE_DOC_DATA","") or
                             permit_res["data"][0].get("ee_doc_data",""))
             if ee:
-                with st.expander("📡 식약처 허가정보 효능효과 전문"):
-                    st.write(ee[:1000])
+                found_efficacy = True
+                st.markdown(f'<span class="api-badge api-ok">● 식약처 허가정보 API</span>',
+                            unsafe_allow_html=True)
+                st.markdown(f"> {ee[:600]}")
+                with st.expander("효능효과 전문 보기"):
+                    st.write(ee[:1500])
+        if eiyak_res["status"] == "ok" and eiyak_res["data"]:
+            val = clean_html(eiyak_res["data"][0].get("efcyQesitm",""))
+            if val:
+                found_efficacy = True
+                st.markdown(f'<span class="api-badge api-ok">● e약은요 API (일반의약품)</span>',
+                            unsafe_allow_html=True)
+                st.markdown(f"> {val[:500]}")
+        if not found_efficacy:
+            if permit_res["status"] == "skip" and eiyak_res["status"] == "skip":
+                st.caption("ℹ️ 공공데이터포털 API 키 미설정 — API 설정 메뉴에서 등록하면 자동으로 채워집니다.")
+            else:
+                st.markdown(
+                    '<div class="nb nb-info">ℹ️ API에서 이 약품의 효능효과 정보를 찾지 못했습니다. '
+                    '약품명이 식약처 등록명과 정확히 일치하지 않거나(예: 규격·제형 표기 차이), '
+                    '전문의약품이라 e약은요에서 제공되지 않는 경우입니다.</div>',
+                    unsafe_allow_html=True
+                )
         st.markdown("**📋 등록 효능효과**")
-        for item in drug.get("efficacy",[]): st.markdown(f"- {item}")
+        local_efficacy = drug.get("efficacy",[])
+        if local_efficacy:
+            for item in local_efficacy: st.markdown(f"- {item}")
+        else:
+            st.caption("등록된 자체 DB 데이터 없음")
 
     # ══ 4. 심사참고자료 ══
     st.markdown('<span id="review"></span>', unsafe_allow_html=True)
@@ -1223,30 +1265,66 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
     with st.container(border=True):
         st.markdown('<div class="sec-eyebrow">CAUTIONS</div>'
                     '<div class="sec-title">⚠️ 주의사항</div>', unsafe_allow_html=True)
+        found_caution = False
         if eiyak_res["status"] == "ok" and eiyak_res["data"]:
             item = eiyak_res["data"][0]
             for field, label in [("atpnWarnQesitm","경고"),("atpnQesitm","주의"),("intrcQesitm","상호작용")]:
                 val = clean_html(item.get(field,""))
                 if val:
-                    st.markdown(f'<span class="api-badge api-ok">● API · {label}</span>',
+                    found_caution = True
+                    st.markdown(f'<span class="api-badge api-ok">● e약은요 API · {label}</span>',
                                 unsafe_allow_html=True)
                     st.markdown(f"> {val[:400]}")
+        if not found_caution:
+            if eiyak_res["status"] == "skip":
+                st.caption("ℹ️ 공공데이터포털 API 키 미설정 — API 설정 메뉴에서 등록하면 자동으로 채워집니다.")
+            elif drug.get("professional") == "전문의약품":
+                st.markdown(
+                    '<div class="nb nb-info">ℹ️ 이 약은 전문의약품입니다. '
+                    'e약은요(15075057) API는 일반의약품만 제공하여 주의사항 정보가 없습니다. '
+                    '식약처 의약품안전나라 또는 첨부문서로 직접 확인이 필요합니다.</div>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.caption("ℹ️ API에서 해당 약품의 주의사항 정보를 찾지 못했습니다.")
         st.markdown("**📋 등록 주의사항**")
-        for item in drug.get("cautions",[]): st.markdown(f"- {item}")
+        local_cautions = drug.get("cautions",[])
+        if local_cautions:
+            for item in local_cautions: st.markdown(f"- {item}")
+        else:
+            st.caption("등록된 자체 DB 데이터 없음")
 
     # ══ 8. 금기사항 ══
     st.markdown('<span id="contra"></span>', unsafe_allow_html=True)
     with st.container(border=True):
         st.markdown('<div class="sec-eyebrow">CONTRAINDICATIONS</div>'
                     '<div class="sec-title">🚫 금기사항</div>', unsafe_allow_html=True)
+        found_contra = False
         if eiyak_res["status"] == "ok" and eiyak_res["data"]:
             val = clean_html(eiyak_res["data"][0].get("seQesitm",""))
             if val:
-                st.markdown(f'<span class="api-badge api-ok">● API · 부작용/금기</span>',
+                found_contra = True
+                st.markdown(f'<span class="api-badge api-ok">● e약은요 API · 부작용/금기</span>',
                             unsafe_allow_html=True)
                 st.markdown(f"> {val[:400]}")
+        if not found_contra:
+            if eiyak_res["status"] == "skip":
+                st.caption("ℹ️ 공공데이터포털 API 키 미설정 — API 설정 메뉴에서 등록하면 자동으로 채워집니다.")
+            elif drug.get("professional") == "전문의약품":
+                st.markdown(
+                    '<div class="nb nb-info">ℹ️ 이 약은 전문의약품입니다. '
+                    'e약은요(15075057) API는 일반의약품만 제공하여 금기사항 정보가 없습니다. '
+                    '식약처 의약품안전나라 또는 첨부문서로 직접 확인이 필요합니다.</div>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.caption("ℹ️ API에서 해당 약품의 금기사항 정보를 찾지 못했습니다.")
         st.markdown("**📋 등록 금기사항**")
-        for item in drug.get("contraindications",[]): st.markdown(f"- {item}")
+        local_contra = drug.get("contraindications",[])
+        if local_contra:
+            for item in local_contra: st.markdown(f"- {item}")
+        else:
+            st.caption("등록된 자체 DB 데이터 없음")
         st.markdown(
             '<div class="nb nb-danger">🚫 최종 금기·상호작용 판단은 최신 허가사항 원문 및 HIRA DUR 결과를 기준으로 하십시오.</div>',
             unsafe_allow_html=True
@@ -1257,16 +1335,20 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
     with st.container(border=True):
         st.markdown('<div class="sec-eyebrow">EVIDENCE & SOURCES</div>'
                     '<div class="sec-title">📎 자료 출처</div>', unsafe_allow_html=True)
-        for src in drug.get("sources",[]):
-            st.markdown(f"""
-            <div class="source-row">
-              <div class="src-sec">{esc(src.get('section',''))}</div>
-              <div>{esc(src.get('publisher',''))} ·
-                <a href="{esc(src.get('url',''))}" target="_blank">{esc(src.get('title',''))}</a>
-                <span style="color:#557068;font-size:.8rem;"> (확인일 {esc(src.get('checked_on',''))})</span>
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
+        sources = drug.get("sources",[])
+        if sources:
+            for src in sources:
+                st.markdown(f"""
+                <div class="source-row">
+                  <div class="src-sec">{esc(src.get('section',''))}</div>
+                  <div>{esc(src.get('publisher',''))} ·
+                    <a href="{esc(src.get('url',''))}" target="_blank">{esc(src.get('title',''))}</a>
+                    <span style="color:#557068;font-size:.8rem;"> (확인일 {esc(src.get('checked_on',''))})</span>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.caption("ℹ️ 이 약제는 자체 DB에 출처 정보가 등록되어 있지 않습니다.")
         st.caption("운영 시 허가사항·급여목록·고시 개정일을 주기적으로 동기화하고 변경 이력을 보존하십시오.")
 
 

@@ -551,6 +551,71 @@ def api_standard_code(drug_name: str, api_key: str) -> dict:
         return {"status":"fail","error":str(e)[:200],"data":None}
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def api_drug_ingredient_effect(drug_name: str, api_key: str) -> dict:
+    """[HIRA] 의약품성분약효정보조회서비스 - 주성분명코드목록조회
+    End Point(확인됨): https://apis.data.go.kr/B551182/msupCmpnMeftInfoService/getMajorCmpnNmCdList
+    데이터포맷: XML (HIRA B551182 계열)
+    설명: 일반명코드·약효분류번호를 통해 성분명·제형·분류명·투여경로 등 조회
+    파라미터: pageNo(필수), numOfRows(필수), serviceKey(필수), numOfRows 외 검색은 일반명 등
+    전문의약품도 커버하므로 e약은요 대신 효능·분류 정보 보조용으로 사용
+    """
+    if not api_key:
+        return {"status":"skip","data":None}
+    try:
+        url = "https://apis.data.go.kr/B551182/msupCmpnMeftInfoService/getMajorCmpnNmCdList"
+        # 약품명에서 성분 핵심어 추출 (괄호 안 성분명이 있으면 그것 우선)
+        import re as _re
+        bracket = _re.search(r'\(([^)]+)\)', drug_name or "")
+        keyword = bracket.group(1).strip() if bracket else (drug_name or "")[:6]
+        r = call_public_api(url, api_key,
+                            {"pageNo":1,"numOfRows":10,"gnlNmCd":keyword},
+                            "의약품성분약효정보")
+        items, header = parse_xml_items(r.text)
+        if not is_api_success(header):
+            # gnlNmCd 파라미터가 없을 경우 빈 파라미터로 재시도
+            r2 = call_public_api(url, api_key,
+                                 {"pageNo":1,"numOfRows":10},
+                                 "의약품성분약효정보(전체)")
+            items, header = parse_xml_items(r2.text)
+            if not is_api_success(header):
+                return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
+        return {"status":"ok","data":items[:5]}
+    except Exception as e:
+        return {"status":"fail","error":str(e)[:200],"data":None}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def api_dur_taboo(drug_name: str, api_key: str) -> dict:
+    """[식약처] 의약품안전사용서비스(DUR)성분정보 - 병용금기 정보조회
+    End Point(확인됨): https://apis.data.go.kr/1471000/DURIrdntInfoService03/getUsjntTabooInfoList02
+    데이터포맷: JSON+XML (식약처 1471000 계열 — type=json 요청 가능)
+    설명: 병용금기 성분 조회. 전문/일반의약품 모두 커버.
+    응답 핵심 필드: MIXTURE_ITEM_NAME(병용금기 대상약), INGR_NAME(성분명), FORM_NAME(제형),
+                  TYPE_NAME(금기유형), PROHBT_CONTENT(금기내용), PROHBT_DETAIL(상세)
+    """
+    if not api_key:
+        return {"status":"skip","data":None}
+    try:
+        url = "https://apis.data.go.kr/1471000/DURIrdntInfoService03/getUsjntTabooInfoList02"
+        r = call_public_api(url, api_key,
+                            {"type":"json","itemName":drug_name,"pageNo":1,"numOfRows":10},
+                            "DUR병용금기")
+        ctype = r.headers.get("content-type","")
+        if "json" in ctype:
+            body = r.json().get("body",{})
+            items = body.get("items",[]) or []
+            if isinstance(items, dict):
+                items = [items.get("item",{})] if items.get("item") else []
+        else:
+            items, header = parse_xml_items(r.text)
+            if not is_api_success(header):
+                return {"status":"fail","error":header.get("resultMsg","API 오류")[:80],"data":None}
+        return {"status":"ok","data":items[:10]}
+    except Exception as e:
+        return {"status":"fail","error":str(e)[:200],"data":None}
+
+
 def api_badge(status: str) -> str:
     if status == "ok":
         return '<span class="api-badge api-ok">● 연동 완료</span>'
@@ -930,10 +995,12 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
 
     # ── API 데이터 일괄 조회 ──
     with st.spinner("공공 API 데이터 조회 중..."):
-        price_res  = api_drug_price(drug.get("name",""), drug.get("ingredient_display",""), api_key)
-        permit_res = api_drug_permit(drug.get("name",""), api_key)
-        eiyak_res  = api_drug_eiyak(drug.get("name",""), api_key)
+        price_res   = api_drug_price(drug.get("name",""), drug.get("ingredient_display",""), api_key)
+        permit_res  = api_drug_permit(drug.get("name",""), api_key)
+        eiyak_res   = api_drug_eiyak(drug.get("name",""), api_key)
         stdcode_res = api_standard_code(drug.get("name",""), api_key)
+        ingeff_res  = api_drug_ingredient_effect(drug.get("name",""), api_key)
+        dur_res     = api_dur_taboo(drug.get("name",""), api_key)
 
     # ── API 상태 패널 ──
     gemini_status = 'ok' if ai_ok() else 'skip'
@@ -948,17 +1015,27 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
       <div class="api-row">
         <span class="ap-name">[15095677] 의약품 허가정보</span>
         {api_badge(permit_res['status'])}
-        <span style="font-size:.74rem;color:#557068;">적응증·허가사항</span>
+        <span style="font-size:.74rem;color:#557068;">적응증·허가사항 (전문/일반 모두)</span>
       </div>
       <div class="api-row">
         <span class="ap-name">[15075057] e약은요</span>
         {api_badge(eiyak_res['status'])}
-        <span style="font-size:.74rem;color:#557068;">효능·용법·주의·금기</span>
+        <span style="font-size:.74rem;color:#557068;">효능·용법·주의·금기 (일반의약품)</span>
+      </div>
+      <div class="api-row">
+        <span class="ap-name">[HIRA] 의약품성분약효정보</span>
+        {api_badge(ingeff_res['status'])}
+        <span style="font-size:.74rem;color:#557068;">성분·약효분류·투여경로 (전문/일반 모두)</span>
+      </div>
+      <div class="api-row">
+        <span class="ap-name">[식약처] DUR 병용금기</span>
+        {api_badge(dur_res['status'])}
+        <span style="font-size:.74rem;color:#557068;">병용금기 성분 정보</span>
       </div>
       <div class="api-row">
         <span class="ap-name">[15067462] 약가마스터_의약품표준코드</span>
         {api_badge(stdcode_res['status'])}
-        <span style="font-size:.74rem;color:#557068;">표준코드(KD코드)·ATC코드 조회</span>
+        <span style="font-size:.74rem;color:#557068;">표준코드(KD코드)·ATC코드</span>
       </div>
       <div class="api-row">
         <span class="ap-name">[15119055] 질병정보</span>
@@ -968,7 +1045,7 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
       <div class="api-row">
         <span class="ap-name">[15067467] 상병마스터</span>
         {api_badge('ok' if api_key else 'skip')}
-        <span style="font-size:.74rem;color:#557068;">정식 KCD 상병코드 마스터 검색</span>
+        <span style="font-size:.74rem;color:#557068;">정식 KCD 상병코드 마스터</span>
       </div>
       <div style="border-top:1px solid #dce8e5;margin:.5rem 0;"></div>
       <div class="api-row">
@@ -984,6 +1061,8 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
         ("[15067461] 약가마스터_의약품주성분", price_res),
         ("[15095677] 의약품 허가정보", permit_res),
         ("[15067462] 약가마스터_의약품표준코드", stdcode_res),
+        ("[HIRA] 의약품성분약효정보", ingeff_res),
+        ("[식약처] DUR 병용금기", dur_res),
     ]
     fails = [(name, res) for name, res in fail_list if res.get("status") == "fail"]
     if fails:
@@ -1167,6 +1246,7 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
         st.markdown('<div class="sec-eyebrow">INDICATIONS & EFFICACY</div>'
                     '<div class="sec-title">✅ 효능효과</div>', unsafe_allow_html=True)
         found_efficacy = False
+        # 1순위: 허가정보 API (전문/일반 모두)
         if permit_res["status"] == "ok" and permit_res["data"]:
             ee = clean_html(permit_res["data"][0].get("EE_DOC_DATA","") or
                             permit_res["data"][0].get("ee_doc_data",""))
@@ -1177,6 +1257,7 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
                 st.markdown(f"> {ee[:600]}")
                 with st.expander("효능효과 전문 보기"):
                     st.write(ee[:1500])
+        # 2순위: e약은요 (일반의약품)
         if eiyak_res["status"] == "ok" and eiyak_res["data"]:
             val = clean_html(eiyak_res["data"][0].get("efcyQesitm",""))
             if val:
@@ -1184,6 +1265,18 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
                 st.markdown(f'<span class="api-badge api-ok">● e약은요 API (일반의약품)</span>',
                             unsafe_allow_html=True)
                 st.markdown(f"> {val[:500]}")
+        # 3순위: 의약품성분약효정보 (전문/일반 모두, 분류명·투여경로 제공)
+        if ingeff_res["status"] == "ok" and ingeff_res["data"]:
+            found_efficacy = True
+            st.markdown(f'<span class="api-badge api-ok">● HIRA 의약품성분약효정보 API</span>',
+                        unsafe_allow_html=True)
+            with st.expander("성분·약효 분류정보 보기 (전문의약품 포함)"):
+                for item in ingeff_res["data"][:3]:
+                    cols_info = " | ".join(
+                        f"{k}: {v}" for k, v in item.items()
+                        if v and str(v).strip() and k
+                    )
+                    st.caption(cols_info[:300] if cols_info else str(item)[:200])
         if not found_efficacy:
             if permit_res["status"] == "skip" and eiyak_res["status"] == "skip":
                 st.caption("ℹ️ 공공데이터포털 API 키 미설정 — API 설정 메뉴에서 등록하면 자동으로 채워집니다.")
@@ -1297,28 +1390,50 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
     # ══ 8. 금기사항 ══
     st.markdown('<span id="contra"></span>', unsafe_allow_html=True)
     with st.container(border=True):
-        st.markdown('<div class="sec-eyebrow">CONTRAINDICATIONS</div>'
-                    '<div class="sec-title">🚫 금기사항</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-eyebrow">CONTRAINDICATIONS · DUR</div>'
+                    '<div class="sec-title">🚫 금기사항 · 병용금기</div>', unsafe_allow_html=True)
         found_contra = False
+
+        # 1순위: DUR 병용금기 (전문/일반 모두, 가장 실무적)
+        if dur_res["status"] == "ok" and dur_res["data"]:
+            found_contra = True
+            st.markdown(f'<span class="api-badge api-ok">● 식약처 DUR 병용금기 API</span>',
+                        unsafe_allow_html=True)
+            with st.expander(f"🔴 병용금기 정보 {len(dur_res['data'])}건 (클릭해서 펼치기)"):
+                for item in dur_res["data"]:
+                    mix_name = item.get("MIXTURE_ITEM_NAME","") or item.get("mixture_item_name","")
+                    ingr = item.get("INGR_NAME","") or item.get("ingr_name","")
+                    content = item.get("PROHBT_CONTENT","") or item.get("prohbt_content","")
+                    detail = item.get("PROHBT_DETAIL","") or item.get("prohbt_detail","")
+                    st.markdown(f"""
+                    <div class="icd-card" style="border-left:3px solid #c0392b;">
+                      <div class="icd-info">
+                        <div class="icd-name">⚠️ {esc(mix_name or ingr)}</div>
+                        {f'<div class="icd-group-label">{esc(content)}</div>' if content else ''}
+                        {f'<div class="icd-reason">{esc(detail[:200])}</div>' if detail else ''}
+                      </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+        # 2순위: e약은요 부작용/금기 (일반의약품)
         if eiyak_res["status"] == "ok" and eiyak_res["data"]:
             val = clean_html(eiyak_res["data"][0].get("seQesitm",""))
             if val:
                 found_contra = True
-                st.markdown(f'<span class="api-badge api-ok">● e약은요 API · 부작용/금기</span>',
+                st.markdown(f'<span class="api-badge api-ok">● e약은요 API · 부작용/금기 (일반의약품)</span>',
                             unsafe_allow_html=True)
                 st.markdown(f"> {val[:400]}")
+
         if not found_contra:
-            if eiyak_res["status"] == "skip":
+            if dur_res["status"] == "skip" and eiyak_res["status"] == "skip":
                 st.caption("ℹ️ 공공데이터포털 API 키 미설정 — API 설정 메뉴에서 등록하면 자동으로 채워집니다.")
-            elif drug.get("professional") == "전문의약품":
+            else:
                 st.markdown(
-                    '<div class="nb nb-info">ℹ️ 이 약은 전문의약품입니다. '
-                    'e약은요(15075057) API는 일반의약품만 제공하여 금기사항 정보가 없습니다. '
-                    '식약처 의약품안전나라 또는 첨부문서로 직접 확인이 필요합니다.</div>',
+                    '<div class="nb nb-info">ℹ️ DUR 병용금기 조회 결과 해당 없음 또는 데이터 없음. '
+                    '최종 금기 확인은 식약처 의약품안전나라 DUR 시스템을 이용하십시오.</div>',
                     unsafe_allow_html=True
                 )
-            else:
-                st.caption("ℹ️ API에서 해당 약품의 금기사항 정보를 찾지 못했습니다.")
+
         st.markdown("**📋 등록 금기사항**")
         local_contra = drug.get("contraindications",[])
         if local_contra:
@@ -1326,7 +1441,8 @@ def render_drug_detail(drug: dict, api_key: str) -> None:
         else:
             st.caption("등록된 자체 DB 데이터 없음")
         st.markdown(
-            '<div class="nb nb-danger">🚫 최종 금기·상호작용 판단은 최신 허가사항 원문 및 HIRA DUR 결과를 기준으로 하십시오.</div>',
+            '<div class="nb nb-danger">🚫 최종 금기·상호작용 판단은 최신 허가사항 원문 및 '
+            'HIRA DUR 처방·조제 지원 시스템 결과를 기준으로 하십시오.</div>',
             unsafe_allow_html=True
         )
 
@@ -1448,8 +1564,12 @@ def page_api_guide() -> None:
          "B551182/diseaseInfoService/getDissNameCodeList"),
         ("의약품 제품 허가정보","15095677","식약처","적응증·허가사항",
          "1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"),
-        ("의약품개요정보(e약은요)","15075057","식약처","효능·용법·주의·금기",
+        ("의약품개요정보(e약은요)","15075057","식약처","효능·용법·주의·금기 (일반의약품)",
          "1471000/DrbEasyDrugInfoService/getDrbEasyDrugList"),
+        ("의약품성분약효정보조회","HIRA","HIRA","성분·약효분류·투여경로 (전문/일반 모두)",
+         "B551182/msupCmpnMeftInfoService/getMajorCmpnNmCdList"),
+        ("DUR성분정보(병용금기)","식약처","식약처","병용금기 성분 정보 (전문/일반 모두)",
+         "1471000/DURIrdntInfoService03/getUsjntTabooInfoList02"),
     ]
     for name, num, org, desc, endpoint in apis:
         st.markdown(f"""
